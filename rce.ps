@@ -1,0 +1,101 @@
+## URL to check
+$url = "http://example.com"
+
+## Path to your Chrome executable (update as needed)
+$chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+## Define a port for remote debugging
+$remoteDebuggingPort = 9222
+
+## Download WebSocket4Net if not already installed
+$nugetUrl = "https://www.nuget.org/api/v2/package/WebSocket4Net/0.15.0"
+$webSocketLibPath = "$env:TEMP\WebSocket4Net"
+
+if (-not (Test-Path $webSocketLibPath)) {
+    Write-Host "Downloading WebSocket4Net..."
+    Invoke-WebRequest -Uri $nugetUrl -OutFile "$env:TEMP\WebSocket4Net.zip"
+
+    ## Extract the DLL from the NuGet package
+    Add-Type -AssemblyName "System.IO.Compression.FileSystem"
+    [System.IO.Compression.ZipFile]::ExtractToDirectory("$env:TEMP\WebSocket4Net.zip", $webSocketLibPath)
+}
+
+## Locate all DLLs inside the extracted WebSocket4Net directory
+$dllFiles = Get-ChildItem "$webSocketLibPath" -Recurse -Filter "*.dll"
+
+## Load each DLL using reflection
+foreach ($dll in $dllFiles) {
+    try {
+        [System.Reflection.Assembly]::LoadFile($dll.FullName) | Out-Null
+        Write-Host "Loaded: $($dll.Name)"
+    } catch {
+        Write-Host "Failed to load: $($dll.FullName)"
+    }
+}
+
+## Launch Chrome with remote debugging enabled
+Start-Process -FilePath $chromePath -ArgumentList "--new-window", "--incognito", "--remote-debugging-port=$remoteDebuggingPort", $url
+
+## Wait for Chrome to start and load the page
+Start-Sleep -Seconds 10
+
+## Prompt for JavaScript code to execute remotely
+$javascriptCode = Read-Host -Prompt "Enter the JavaScript code to execute remotely"
+
+## Try to connect to Chrome DevTools Protocol
+try {
+    ## Get the DevTools endpoint
+    $chromeEndpoint = Invoke-RestMethod -Uri "http://localhost:$remoteDebuggingPort/json" | Where-Object { $_.url -like "*$url*" }
+
+    if ($chromeEndpoint) {
+        $webSocketDebuggerUrl = $chromeEndpoint.webSocketDebuggerUrl
+
+        ## Create a WebSocket connection
+        $ws = New-Object WebSocket4Net.WebSocket($webSocketDebuggerUrl)
+
+        ## Event handler for receiving messages
+        $receivedMessage = $null
+        $ws.OnMessage += {
+            param ($sender, $e)
+            $receivedMessage = $e.Message
+        }
+
+        ## Open the WebSocket connection
+        $ws.Open()
+        Start-Sleep -Seconds 5  # Allow time for the connection to be established
+
+        ## Prepare the command to evaluate the custom JavaScript
+        $jsonCommand = @{
+            "id" = 1;
+            "method" = "Runtime.evaluate";
+            "params" = @{
+                "expression" = $javascriptCode;
+                "returnByValue" = $true  # Ensure return values are included
+            }
+        } | ConvertTo-Json
+
+        ## Send the command to evaluate the custom JavaScript
+        $ws.Send($jsonCommand)
+        Start-Sleep -Seconds 5  # Allow time to receive the response
+
+        ## Close the WebSocket connection
+        $ws.Close()
+
+        ## Process the response
+        if ($receivedMessage) {
+            $response = $receivedMessage | ConvertFrom-Json
+            if ($response.result) {
+                $resultValue = $response.result.value
+                Write-Host "Execution Result: $resultValue"
+            } else {
+                Write-Host "No result or error in execution."
+            }
+        } else {
+            Write-Host "No response received from Chrome."
+        }
+    } else {
+        Write-Host "Chrome process for the specified URL not found."
+    }
+} catch {
+    Write-Host "Error: Could not connect to Chrome's DevTools Protocol."
+}
